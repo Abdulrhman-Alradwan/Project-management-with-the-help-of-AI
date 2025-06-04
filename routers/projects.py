@@ -61,5 +61,31 @@ async def create_project(user : user_dependency,
     db.commit()
 
 
+@router.post("/{project_id}/categories", status_code=status.HTTP_201_CREATED)
+async def create_category_for_project(
+        user: user_dependency,
+        db: db_dependency,
+        category_request: CategoryRequest,
+        project_id: int = Path(..., description="current project id")):
 
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.owner_id == user.get('id')
+    ).first()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="The project does not exist")
+
+
+    category_model = TodoCategory(
+        name=category_request.name,
+        project_id=project_id,
+        teamleader_id=None
+    )
+
+    db.add(category_model)
+    db.commit()
 
