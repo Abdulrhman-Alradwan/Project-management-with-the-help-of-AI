@@ -6,14 +6,14 @@ import re  # لاستخدام التعابير النمطية للتحقق من 
 from enum import Enum as PyEnum
 
 
-class RoleEnum(PyEnum):
-    MANAGER = "Manager"
-    TESTER = "Tester"
-    USER = "User"
+class RoleEnum(str ,PyEnum):
+    Manager = "Manager"
+    Tester = "Tester"
+    User = "User"
 
-class GenderEnum(PyEnum):
-    MALE = "Male"
-    FEMALE = "Female"
+class GenderEnum(str, PyEnum):
+    Male = "Male"
+    Female = "Female"
 
 class PriorityEnum(PyEnum):
     HIGH = "high"
@@ -29,6 +29,7 @@ class User(Base):
     id = Column(Integer, primary_key=True , index=True)
     first_name = Column(String,nullable=False)
     last_name = Column(String,nullable=False)
+    profile_picture = Column(String, nullable=True)
     email = Column(String,unique=True,nullable=False)
     hashed_password = Column(String,nullable=False)
     role = Column(Enum(RoleEnum), nullable=False)
@@ -86,9 +87,10 @@ class Task(Base):
 class TaskInfo(Base):
     __tablename__ = 'task_info'
 
-    id = Column(Integer,ForeignKey('task.id'))
+    id = Column(Integer, primary_key=True, index=True)
+    task_num = Column(Integer,ForeignKey('task.id'))
     update_date = Column(DateTime, nullable=True)
-    task_status = Column(String,ForeignKey('task.status'),nullable=False)
+    task_status = Column(String,nullable=False)
 
 
 class Sprint(Base):

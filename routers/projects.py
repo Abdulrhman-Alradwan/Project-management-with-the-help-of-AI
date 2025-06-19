@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Optional
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from starlette import status
 
 from models import Project, User, UserProject, RoleEnum
@@ -45,7 +45,7 @@ async def create_project(user : user_dependency,
     if user is None :
         raise HTTPException(status_code=401, detail='Authentication Failed')
 
-    if user.get('role') != RoleEnum.MANAGER.value:
+    if user.get('role') != RoleEnum.Manager.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail='Only users with Manager role can create projects'
@@ -68,16 +68,15 @@ async def create_project(user : user_dependency,
 
 @router.put("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def update_project_name(
-        user: user_dependency,
-        db: db_dependency,
-        project_name: str = Field(..., min_length=5, max_length=40),
-        project_id: int = Path(gt=0)
+    user: user_dependency,
+    db: db_dependency,
+    project_name: str = Query(..., min_length=5, max_length=40),  # تم التعديل هنا
+    project_id: int = Path(gt=0)
 ):
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication Failed')
 
-
-    if user.get('role') != RoleEnum.MANAGER.value:
+    if user.get('role') != RoleEnum.Manager.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail='Only users with Manager role can update projects'
@@ -87,7 +86,6 @@ async def update_project_name(
 
     if project_model is None:
         raise HTTPException(status_code=404, detail='Project not found')
-
 
     if project_model.owner_id != user.get('id'):
         raise HTTPException(
@@ -111,7 +109,7 @@ async def add_user_to_project(
         raise HTTPException(status_code=401, detail='Authentication Failed')
 
     # التحقق من أن دور المستخدم هو Manager
-    if user.get('role') != RoleEnum.MANAGER.value:
+    if RoleEnum(user.get('role')) != RoleEnum.Manager:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail='Only Managers can add users to projects'
@@ -135,7 +133,7 @@ async def add_user_to_project(
         raise HTTPException(status_code=404, detail='User not found')
 
     # التحقق من أن المستخدم المضاف ليس مديراً
-    if user_to_add.role == RoleEnum.MANAGER.value:
+    if user_to_add.role == RoleEnum.Manager.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail='Cannot add another manager to the project'
