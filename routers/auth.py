@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException , UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette import status
-from models import User, RoleEnum, GenderEnum
+from models import User, RoleEnum, GenderEnum, Project, UserProject
 from passlib.context import CryptContext
 from database import  SessionLocal
 from fastapi.security import OAuth2PasswordRequestForm , OAuth2PasswordBearer
@@ -99,6 +99,23 @@ async def get_current_user(token : Annotated[str , Depends(oauth2_bearer)]):
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail='Could not Validate user.')
+
+
+def check_project_permission(db: Session, user_id: int, project_id: int):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return False
+
+    if project.owner_id == user_id:
+        return True
+
+    user_project = db.query(UserProject).join(User).filter(
+        UserProject.user_id == user_id,
+        UserProject.project_id == project_id,
+        User.role == RoleEnum.Manager.value
+    ).first()
+
+    return user_project is not None
 
 
 
