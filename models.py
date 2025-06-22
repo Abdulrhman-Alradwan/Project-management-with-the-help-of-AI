@@ -63,6 +63,8 @@ class User(Base):
     owned_projects = relationship("Project", back_populates="owner")
     projects = relationship("UserProject", back_populates="user")
     tasks = relationship("Task", back_populates="worker")
+    comments = relationship("Comment", back_populates="user")
+    replies = relationship("Reply", back_populates="user")
 
 
 
@@ -112,7 +114,7 @@ class Task(Base):
     status = Column(Enum(TaskStatus), default=TaskStatus.NOT_AVAILABLE)
     dependent_on = Column(Integer,nullable=True)
     dependency_type = Column(Enum(DependencyType), default=DependencyType.NONE)
-    comments = Column(String, nullable=True)
+    #comments = Column(String, nullable=True)
     priority = Column(Enum(PriorityEnum), nullable=False, default=PriorityEnum.MEDIUM)
     worker_id = Column(Integer, ForeignKey('user.id'),nullable=True)
     sprint_id = Column(Integer , ForeignKey('sprint.id'),nullable=True)
@@ -124,6 +126,7 @@ class Task(Base):
     sprint = relationship("Sprint", back_populates="tasks")
     epic = relationship("Epic", back_populates="tasks")
     info = relationship("TaskInfo", back_populates="task", uselist=False)
+    comments = relationship("Comment", back_populates="task")
 
 class TaskInfo(Base):
     __tablename__ = 'task_info'
@@ -177,10 +180,31 @@ class UserProject(Base):
     project = relationship("Project", back_populates="users")
 
 
+class Comment(Base):
+    __tablename__ = 'comments'
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    user_id = Column(Integer, ForeignKey('user.id'))  # تغيير من 'users.id' إلى 'user.id'
+    task_id = Column(Integer, ForeignKey('task.id'))  # تغيير من 'tasks.id' إلى 'task.id'
+
+    user = relationship("User", back_populates="comments")
+    task = relationship("Task", back_populates="comments")
+    replies = relationship("Reply", back_populates="comment", cascade="all, delete")
 
 
+class Reply(Base):
+    __tablename__ = 'replies'
 
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    user_id = Column(Integer, ForeignKey('user.id'))  # تغيير من 'users.id' إلى 'user.id'
+    comment_id = Column(Integer, ForeignKey('comments.id'))
 
+    user = relationship("User", back_populates="replies")
+    comment = relationship("Comment", back_populates="replies")
 
 
 
