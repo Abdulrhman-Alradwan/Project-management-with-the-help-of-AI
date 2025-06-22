@@ -8,7 +8,7 @@ from fastapi import APIRouter , Depends
 from database import  SessionLocal
 from .auth import get_current_user , check_project_permission
 from fastapi import status, HTTPException, Path
-from models import Epic, Project, SprintDuration, Sprint, Task, TaskStatus, TaskInfo
+from models import Epic, Project, SprintDuration, Sprint, Task, TaskStatus, TaskInfo, DependencyType
 
 router = APIRouter(
     prefix='/sprint',
@@ -75,7 +75,35 @@ async def check_sprint_expiration(db: Session):
         await asyncio.sleep(120)  # 1800 ثانية = 30 دقيقة
 
 
+def check_dependency_status(db: Session, task: Task) -> bool:
+    """
+    تحقق من حالة تبعيات المهمة.
+    ترجع True إذا كانت التبعية مكتملة (أو مستوفية الشروط) ويمكن بدء المهمة، وإلا ترجع False.
+    """
+    if not task.dependent_on:
+        return True
 
+    # جلب المهمة المعتمدة عليها
+    dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+    if not dependency_task:
+        return False
+
+    # التحقق من نوع التبعية وحالة المهمة المعتمدة عليها
+    if task.dependency_type == DependencyType.FS:
+        # FS: يجب أن تكون المهمة المعتمدة عليها مكتملة
+        return dependency_task.status == TaskStatus.COMPLETE
+
+    elif task.dependency_type == DependencyType.SS:
+        # SS: يجب أن تكون المهمة المعتمدة عليها قد بدأت (أي في حالة بدأت أو بعدها)
+        return dependency_task.status in [
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.TESTING,
+            TaskStatus.FEEDBACK,
+            TaskStatus.COMPLETE
+        ]
+
+    # إذا كان نوع التبعية غير معروف، نعتبر أن التبعية لم تكتمل
+    return False
 
 
 @router.post("/{project_id}", status_code=status.HTTP_201_CREATED)
@@ -229,7 +257,6 @@ async def launch_sprint(
         db: db_dependency,
         sprint_id: int = Path(gt=0)
 ):
-    # التحقق من توثيق المستخدم
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication required')
 
@@ -256,7 +283,7 @@ async def launch_sprint(
     tasks = db.query(Task).filter(Task.sprint_id == sprint_id).all()
 
     # التحقق من أن الـ Sprint يحتوي على 5 مهام على الأقل
-    if len(tasks) <= 5:
+    if len(tasks) < 5:
         raise HTTPException(
             status_code=400,
             detail='Sprint must contain at least 5 tasks'
@@ -273,18 +300,32 @@ async def launch_sprint(
 
     current_time = datetime.now(timezone.utc)
 
-    # تحديث جميع المهام
+    # تحديث جميع المهام مع مراعاة الاعتماديات والحالات الخاصة
     for task in tasks:
-        # تغيير حالة المهمة إلى available
-        task.status = TaskStatus.AVAILABLE
+        # إذا كانت المهمة تعتمد على مهمة أخرى
+        if task.dependent_on:
+            # التحقق مما إذا كانت التبعية قد اكتملت بالفعل
+            if check_dependency_status(db, task):
+                # إذا اكتملت التبعية، يمكن وضع المهمة في حالة AVAILABLE
+                task.status = TaskStatus.AVAILABLE
+            else:
+                # إذا لم تكتمل التبعية بعد، توضع في حالة WAIT
+                task.status = TaskStatus.WAIT
+        # إذا كانت المهمة في حالة TESTING أو FEEDBACK، اتركها كما هي
+        elif task.status in [TaskStatus.TESTING, TaskStatus.FEEDBACK]:
+            continue  # لا تغير الحالة ولا تسجل في task_info
+        # غير ذلك، ضع الحالة على AVAILABLE
+        else:
+            task.status = TaskStatus.AVAILABLE
 
-        # تسجيل التغيير في task_info
-        task_info = TaskInfo(
-            task_num=task.id,
-            update_date=current_time,
-            task_status=TaskStatus.AVAILABLE.value
-        )
-        db.add(task_info)
+        # تسجيل التغيير في task_info فقط إذا غيرنا الحالة
+        if task.status != TaskStatus.WAIT and task.status not in [TaskStatus.TESTING, TaskStatus.FEEDBACK]:
+            task_info = TaskInfo(
+                task_num=task.id,
+                update_date=current_time,
+                task_status=task.status.value
+            )
+            db.add(task_info)
 
     # حساب وقت الانتهاء بناءً على المدة
     duration_mapping = {
@@ -294,8 +335,8 @@ async def launch_sprint(
         SprintDuration.FOUR_WEEKS: timedelta(weeks=4)
     }
 
-    # يجب أن نستخدم القيمة الفعلية للـ duration
-    duration_delta = duration_mapping[sprint.duration]  # بدون قيمة افتراضية
+    # استخدام القيمة الفعلية للـ duration
+    duration_delta = duration_mapping[sprint.duration]
 
     sprint.start_date = current_time
     sprint.end_date = current_time + duration_delta
@@ -306,5 +347,8 @@ async def launch_sprint(
     return {
         "message": "Sprint launched successfully",
         "start_date": sprint.start_date.isoformat(),
-        "end_date": sprint.end_date.isoformat()
+        "end_date": sprint.end_date.isoformat(),
+        "tasks_updated": len(tasks) - len([t for t in tasks if t.status in [TaskStatus.TESTING, TaskStatus.FEEDBACK]])
     }
+
+

@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException
 from starlette import status
 from database import  SessionLocal
-from models import PriorityEnum, DependencyType, Project, User, Task, TaskStatus, TaskInfo, UserProject, RoleEnum
+from models import PriorityEnum, DependencyType, Project, User, Task, TaskStatus, TaskInfo, UserProject, RoleEnum, \
+    Sprint
 from routers.auth import get_current_user, check_project_permission
 
 router = APIRouter(
@@ -29,6 +30,99 @@ db_dependency = Annotated[Session , Depends(get_db)]
 user_dependency = Annotated[dict , Depends(get_current_user)]
 
 
+def check_ss_dependency(db: Session, task: Task) -> bool:
+    """
+    التحقق من إمكانية بدء المهمة بناءً على اعتمادية SS
+    """
+    if not task.dependent_on:
+        return True
+
+    # جلب المهمة المعتمدة عليها
+    dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+
+    if not dependency_task:
+        return False
+
+    # الحالات المسموحة: in_progress, testing, feedback, complete
+    allowed_statuses = [
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.TESTING,
+        TaskStatus.FEEDBACK,
+        TaskStatus.COMPLETE
+    ]
+
+    return dependency_task.status in allowed_statuses
+
+
+def check_fs_dependency(db: Session, task: Task) -> bool:
+    """
+    التحقق من إمكانية بدء المهمة بناءً على اعتمادية FS
+    """
+    if not task.dependent_on:
+        return True
+
+    # جلب المهمة المعتمدة عليها
+    dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+
+    if not dependency_task:
+        return False
+
+    # يجب أن تكون المهمة المعتمدة عليها مكتملة
+    return dependency_task.status == TaskStatus.COMPLETE
+
+
+def check_dependent_tasks(db: Session, completed_task_id: int):
+    """
+    تحقق من المهام التي تعتمد على المهمة المكتملة وتحديث حالتها إذا لزم الأمر
+    """
+    # البحث عن المهام التي تعتمد على هذه المهمة
+    dependent_tasks = db.query(Task).filter(Task.dependent_on == completed_task_id).all()
+
+    for task in dependent_tasks:
+        # إذا كانت الاعتمادية من نوع FS وتحققت الشروط
+        if task.dependency_type == DependencyType.FS:
+            # يمكن تغيير حالة المهمة إلى AVAILABLE إذا كانت في حالة WAIT
+            if task.status == TaskStatus.WAIT:
+                task.status = TaskStatus.AVAILABLE
+
+                # تسجيل التغيير في task_info
+                current_time = datetime.now(timezone.utc)
+                task_info = TaskInfo(
+                    task_num=task.id,
+                    update_date=current_time,
+                    task_status=TaskStatus.AVAILABLE.value
+                )
+                db.add(task_info)
+
+    db.commit()
+    db.refresh()
+
+def check_ss_dependent_tasks(db: Session, started_task_id: int):
+    """
+    تحقق من المهام التي تعتمد على المهمة التي بدأت (من نوع SS) وتحديث حالتها إذا لزم الأمر
+    """
+    # البحث عن المهام التي تعتمد على هذه المهمة ونوع الاعتمادية SS
+    dependent_tasks = db.query(Task).filter(
+        Task.dependent_on == started_task_id,
+        Task.dependency_type == DependencyType.SS
+    ).all()
+
+    for task in dependent_tasks:
+        # يمكن تغيير حالة المهمة إلى AVAILABLE إذا كانت في حالة WAIT
+        if task.status == TaskStatus.WAIT:
+            task.status = TaskStatus.AVAILABLE
+
+            # تسجيل التغيير في task_info
+            current_time = datetime.now(timezone.utc)
+            task_info = TaskInfo(
+                task_num=task.id,
+                update_date=current_time,
+                task_status=TaskStatus.AVAILABLE.value
+            )
+            db.add(task_info)
+
+    db.commit()
+    db.refresh()
 
 class CreateTaskRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
@@ -125,3 +219,274 @@ async def create_task(
         "worker_id": task.worker_id,
         "priority": task.priority
     }
+
+
+@router.put("/{task_id}/start", status_code=status.HTTP_200_OK)
+async def start_task(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن المستخدم هو العامل المسند إليه المهمة
+    if task.worker_id != user.get('id'):
+        raise HTTPException(
+            status_code=403,
+            detail='Only assigned worker can start this task'
+        )
+
+    # التحقق من أن الحالة الحالية تسمح بالبدء (available أو feedback)
+    if task.status not in [TaskStatus.AVAILABLE, TaskStatus.FEEDBACK]:
+        raise HTTPException(
+            status_code=400,
+            detail='Task must be in available or feedback status to start'
+        )
+
+    # التحقق من أن المهمة في sprint نشط
+    if not task.sprint_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in any sprint'
+        )
+
+    sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+    if not sprint or not sprint.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in an active sprint'
+        )
+
+    # التحقق من الاعتماديات حسب النوع
+    """if task.dependency_type == DependencyType.SS:
+        if not check_ss_dependency(db, task):
+            raise HTTPException(
+                status_code=400,
+                detail='Cannot start task: dependent task has not started yet'
+            )
+
+    elif task.dependency_type == DependencyType.FS:
+        if not check_fs_dependency(db, task):
+            raise HTTPException(
+                status_code=400,
+                detail='Cannot start task: dependent task is not complete'
+            )"""
+
+    # تغيير حالة المهمة
+    task.status = TaskStatus.IN_PROGRESS
+
+    # تسجيل التغيير في task_info
+    current_time = datetime.now(timezone.utc)
+    task_info = TaskInfo(
+        task_num=task_id,
+        update_date=current_time,
+        task_status=TaskStatus.IN_PROGRESS.value
+    )
+    db.add(task_info)
+    db.commit()
+
+    # التحقق من تأثير بدء المهمة على المهام المعتمدة عليها من نوع SS
+    check_ss_dependent_tasks(db, task_id)
+
+    return {
+        "message": "Task started successfully",
+        "task_id": task_id,
+        "new_status": TaskStatus.IN_PROGRESS.value
+    }
+
+
+@router.put("/{task_id}/mark-testing", status_code=status.HTTP_200_OK)
+async def mark_task_as_testing(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن المستخدم هو العامل المسند إليه المهمة
+    if task.worker_id != user.get('id'):
+        raise HTTPException(
+            status_code=403,
+            detail='Only assigned worker can mark task as testing'
+        )
+
+    # التحقق من أن الحالة الحالية هي IN_PROGRESS
+    if task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400,
+            detail='Task must be in progress to mark as testing'
+        )
+
+    # التحقق من أن المهمة في sprint نشط
+    if not task.sprint_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in any sprint'
+        )
+
+    sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+    if not sprint or not sprint.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in an active sprint'
+        )
+
+    # تغيير حالة المهمة
+    task.status = TaskStatus.TESTING
+
+    # تسجيل التغيير في task_info
+    current_time = datetime.now(timezone.utc)
+    task_info = TaskInfo(
+        task_num=task_id,
+        update_date=current_time,
+        task_status=TaskStatus.TESTING.value
+    )
+    db.add(task_info)
+    db.commit()
+
+    return {
+        "message": "Task marked for testing",
+        "task_id": task_id,
+        "new_status": TaskStatus.TESTING.value
+    }
+
+
+@router.put("/{task_id}/mark-feedback", status_code=status.HTTP_200_OK)
+async def mark_task_as_feedback(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # التحقق من أن المستخدم له دور Tester
+    if user.get('role') != RoleEnum.Tester.value:
+        raise HTTPException(
+            status_code=403,
+            detail='Only testers can mark tasks as feedback'
+        )
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن الحالة الحالية هي TESTING
+    if task.status != TaskStatus.TESTING:
+        raise HTTPException(
+            status_code=400,
+            detail='Task must be in testing status to mark as feedback'
+        )
+
+    # التحقق من أن المهمة في sprint نشط
+    if not task.sprint_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in any sprint'
+        )
+
+    sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+    if not sprint or not sprint.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in an active sprint'
+        )
+
+    # تغيير حالة المهمة
+    task.status = TaskStatus.FEEDBACK
+
+    # تسجيل التغيير في task_info
+    current_time = datetime.now(timezone.utc)
+    task_info = TaskInfo(
+        task_num=task_id,
+        update_date=current_time,
+        task_status=TaskStatus.FEEDBACK.value
+    )
+    db.add(task_info)
+    db.commit()
+
+    return {
+        "message": "Task marked for feedback",
+        "task_id": task_id,
+        "new_status": TaskStatus.FEEDBACK.value
+    }
+
+
+@router.put("/{task_id}/mark-complete", status_code=status.HTTP_200_OK)
+async def mark_task_as_complete(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # التحقق من أن المستخدم له دور Tester
+    if user.get('role') != RoleEnum.Tester.value:
+        raise HTTPException(
+            status_code=403,
+            detail='Only testers can mark tasks as complete'
+        )
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن الحالة الحالية هي TESTING
+    if task.status != TaskStatus.TESTING:
+        raise HTTPException(
+            status_code=400,
+            detail='Task must be in testing status to mark as complete'
+        )
+
+    # التحقق من أن المهمة في sprint نشط
+    if not task.sprint_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in any sprint'
+        )
+
+    sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+    if not sprint or not sprint.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in an active sprint'
+        )
+
+    # تغيير حالة المهمة
+    task.status = TaskStatus.COMPLETE
+
+    # تسجيل التغيير في task_info
+    current_time = datetime.now(timezone.utc)
+    task_info = TaskInfo(
+        task_num=task_id,
+        update_date=current_time,
+        task_status=TaskStatus.COMPLETE.value
+    )
+    db.add(task_info)
+    db.commit()
+
+    # التحقق من تأثير إكمال المهمة على المهام المعتمدة عليها
+    check_dependent_tasks(db, task_id)
+
+    return {
+        "message": "Task marked as complete",
+        "task_id": task_id,
+        "new_status": TaskStatus.COMPLETE.value
+    }
+
+
