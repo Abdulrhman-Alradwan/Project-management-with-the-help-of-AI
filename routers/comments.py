@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Path
 from starlette import status
 from database import SessionLocal
-from models import Comment, Reply, User, Task, UserProject
+from models import Comment, Reply, User, Task, UserProject, RoleEnum, Project
 from routers.auth import get_current_user, check_project_permission
 
 router = APIRouter(
@@ -160,3 +160,146 @@ async def get_task_comments(
         result.append(comment_data)
 
     return {"comments": result}
+
+
+@router.delete("/replies/{reply_id}", status_code=status.HTTP_200_OK)
+async def delete_reply(
+        user: user_dependency,
+        db: db_dependency,
+        reply_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # جلب الرد المطلوب
+    reply = db.query(Reply).filter(Reply.id == reply_id).first()
+    if not reply:
+        raise HTTPException(status_code=404, detail='Reply not found')
+
+    # جلب التعليق المرتبط بالرد
+    comment = db.query(Comment).filter(Comment.id == reply.comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail='Comment not found')
+
+    # جلب المهمة المرتبطة بالتعليق
+    task = db.query(Task).filter(Task.id == comment.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # جلب المشروع المرتبط بالمهمة
+    project = db.query(Project).filter(Project.id == task.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من الصلاحيات:
+    # 1. إذا كان المستخدم الحالي هو صاحب الرد
+    # 2. أو إذا كان المستخدم الحالي هو صاحب المهمة (العامل المسند إليه)
+    # 3. أو إذا كان المستخدم الحالي هو مالك المشروع
+    # 4. أو إذا كان المستخدم الحالي مدير المشروع
+    has_permission = False
+
+    # 1. صاحب الرد
+    if user.get('id') == reply.user_id:
+        has_permission = True
+
+    # 2. صاحب المهمة (العامل المسند إليه)
+    elif task.worker_id == user.get('id'):
+        has_permission = True
+
+    # 3. مالك المشروع
+    elif project.owner_id == user.get('id'):
+        has_permission = True
+
+    # 4. مدير المشروع
+    else:
+        # التحقق إذا كان المستخدم مدير في المشروع
+        user_project = db.query(UserProject).join(User).filter(
+            UserProject.user_id == user.get('id'),
+            UserProject.project_id == project.id,
+            User.role == RoleEnum.Manager.value
+        ).first()
+        if user_project:
+            has_permission = True
+
+    if not has_permission:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='You do not have permission to delete this reply'
+        )
+
+    # حذف الرد
+    db.delete(reply)
+    db.commit()
+
+    return {"message": "Reply deleted successfully"}
+
+
+@router.delete("/comments/{comment_id}", status_code=status.HTTP_200_OK)
+async def delete_comment(
+        user: user_dependency,
+        db: db_dependency,
+        comment_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # جلب التعليق
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail='Comment not found')
+
+    # جلب المهمة المرتبطة بالتعليق
+    task = db.query(Task).filter(Task.id == comment.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # جلب المشروع المرتبط بالمهمة
+    project = db.query(Project).filter(Project.id == task.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من الصلاحيات:
+    # 1. إذا كان المستخدم الحالي هو صاحب التعليق
+    # 2. أو إذا كان المستخدم الحالي هو صاحب المهمة (العامل المسند إليه)
+    # 3. أو إذا كان المستخدم الحالي هو مالك المشروع
+    # 4. أو إذا كان المستخدم الحالي مدير المشروع
+    has_permission = False
+
+    # 1. صاحب التعليق
+    if user.get('id') == comment.user_id:
+        has_permission = True
+
+    # 2. صاحب المهمة (العامل المسند إليه)
+    elif task.worker_id == user.get('id'):
+        has_permission = True
+
+    # 3. مالك المشروع
+    elif project.owner_id == user.get('id'):
+        has_permission = True
+
+    # 4. مدير المشروع
+    else:
+        # التحقق إذا كان المستخدم مدير في المشروع
+        user_project = db.query(UserProject).join(User).filter(
+            UserProject.user_id == user.get('id'),
+            UserProject.project_id == project.id,
+            User.role == RoleEnum.Manager.value
+        ).first()
+        if user_project:
+            has_permission = True
+
+    if not has_permission:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='You do not have permission to delete this comment'
+        )
+
+    # حذف جميع الردود المرتبطة بالتعليق أولاً
+    db.query(Reply).filter(Reply.comment_id == comment_id).delete()
+
+    # حذف التعليق نفسه
+    db.delete(comment)
+    db.commit()
+
+    return {"message": "Comment and its replies deleted successfully"}
+

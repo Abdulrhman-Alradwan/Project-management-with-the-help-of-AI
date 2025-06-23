@@ -265,7 +265,7 @@ async def launch_sprint(
     if not sprint:
         raise HTTPException(status_code=404, detail='Sprint not found')
 
-    # التحقق من الصلاحيات (مالك أو مدير المشروع)
+    # التحقق من الصلاحيات
     if not check_project_permission(db, user.get('id'), sprint.project_id):
         raise HTTPException(
             status_code=403,
@@ -298,28 +298,48 @@ async def launch_sprint(
             detail=f'Unassigned tasks found: {unassigned_ids}'
         )
 
+    # التحقق الجديد: المهام المعتمدة عليها يجب أن تكون في نفس الـ Sprint أو مكتملة
+    dependency_errors = []
+    for task in tasks:
+        if task.dependent_on:
+            dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+
+            if not dependency_task:
+                dependency_errors.append(f"Task {task.id} depends on non-existent task {task.dependent_on}")
+                continue
+
+            # التحقق من أن المهمة التابعة إما في نفس الـ Sprint أو مكتملة
+            if dependency_task.sprint_id != sprint_id and dependency_task.status != TaskStatus.COMPLETE:
+                dependency_errors.append(
+                    f"Task {task.id} depends on task {task.dependent_on} "
+                    f"which is not in this sprint ({dependency_task.sprint_id}) "
+                    f"and not complete ({dependency_task.status})"
+                )
+
+    if dependency_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Dependency validation failed",
+                "errors": dependency_errors
+            }
+        )
+
     current_time = datetime.now(timezone.utc)
 
     # تحديث جميع المهام مع مراعاة الاعتماديات والحالات الخاصة
     for task in tasks:
-        # إذا كانت المهمة تعتمد على مهمة أخرى
         if task.dependent_on:
-            # التحقق مما إذا كانت التبعية قد اكتملت بالفعل
             if check_dependency_status(db, task):
-                # إذا اكتملت التبعية، يمكن وضع المهمة في حالة AVAILABLE
                 task.status = TaskStatus.AVAILABLE
             else:
-                # إذا لم تكتمل التبعية بعد، توضع في حالة WAIT
                 task.status = TaskStatus.WAIT
-        # إذا كانت المهمة في حالة TESTING أو FEEDBACK، اتركها كما هي
         elif task.status in [TaskStatus.TESTING, TaskStatus.FEEDBACK]:
-            continue  # لا تغير الحالة ولا تسجل في task_info
-        # غير ذلك، ضع الحالة على AVAILABLE
+            continue
         else:
             task.status = TaskStatus.AVAILABLE
 
-        # تسجيل التغيير في task_info فقط إذا غيرنا الحالة
-        if task.status != TaskStatus.WAIT and task.status not in [TaskStatus.TESTING, TaskStatus.FEEDBACK]:
+        if task.status not in [TaskStatus.TESTING, TaskStatus.FEEDBACK]:
             task_info = TaskInfo(
                 task_num=task.id,
                 update_date=current_time,
@@ -327,7 +347,7 @@ async def launch_sprint(
             )
             db.add(task_info)
 
-    # حساب وقت الانتهاء بناءً على المدة
+    # حساب وقت الانتهاء
     duration_mapping = {
         SprintDuration.ONE_WEEK: timedelta(weeks=1),
         SprintDuration.TWO_WEEKS: timedelta(weeks=2),
@@ -335,7 +355,6 @@ async def launch_sprint(
         SprintDuration.FOUR_WEEKS: timedelta(weeks=4)
     }
 
-    # استخدام القيمة الفعلية للـ duration
     duration_delta = duration_mapping[sprint.duration]
 
     sprint.start_date = current_time
@@ -351,4 +370,106 @@ async def launch_sprint(
         "tasks_updated": len(tasks) - len([t for t in tasks if t.status in [TaskStatus.TESTING, TaskStatus.FEEDBACK]])
     }
 
+
+@router.delete("/{task_id}/sprint", status_code=status.HTTP_200_OK)
+async def remove_task_from_sprint(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن المهمة مرتبطة بسباق
+    if not task.sprint_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Task is not in any sprint'
+        )
+
+    # جلب الـ Sprint المرتبط بالمهمة
+    sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+    if not sprint:
+        raise HTTPException(status_code=404, detail='Sprint not found')
+
+    # التحقق من أن الـ Sprint لم يبدأ أو ينتهي بعد
+    if sprint.is_active or sprint.is_completed:
+        raise HTTPException(
+            status_code=400,
+            detail='Cannot remove task from an active or completed sprint'
+        )
+
+    # التحقق من صلاحيات المستخدم
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or manager can remove tasks from sprint'
+        )
+
+    # حفظ معرف السباق قبل الإزالة
+    old_sprint_id = task.sprint_id
+
+    # إزالة المهمة من الـ Sprint فقط
+    task.sprint_id = None
+
+    db.commit()
+
+    return {
+        "message": "Task removed from sprint successfully",
+        "task_id": task_id,
+        "sprint_id": old_sprint_id,
+        "task_status_remains": task.status.value
+    }
+
+
+
+@router.delete("/{sprint_id}", status_code=status.HTTP_200_OK)
+async def delete_sprint(
+    user: user_dependency,
+    db: db_dependency,
+    sprint_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب الـ Sprint المطلوب
+    sprint = db.query(Sprint).filter(Sprint.id == sprint_id).first()
+    if not sprint:
+        raise HTTPException(status_code=404, detail='Sprint not found')
+
+    # التحقق من الصلاحيات (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), sprint.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can delete sprints'
+        )
+
+    # التحقق من أن الـ Sprint ليس نشطاً أو مكتملاً
+    if sprint.is_active or sprint.is_completed:
+        raise HTTPException(
+            status_code=400,
+            detail='Cannot delete an active or completed sprint'
+        )
+
+    # جلب جميع المهام المرتبطة بالـ Sprint
+    tasks = db.query(Task).filter(Task.sprint_id == sprint_id).all()
+
+    # إزالة ارتباط المهام بالـ Sprint
+    for task in tasks:
+        task.sprint_id = None
+
+    # حذف الـ Sprint
+    db.delete(sprint)
+    db.commit()
+
+    return {
+        "message": "Sprint deleted successfully",
+        "sprint_id": sprint_id,
+        "tasks_removed": len(tasks)
+    }
 

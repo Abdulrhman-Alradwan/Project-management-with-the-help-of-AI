@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from starlette import status
-from models import Project, User, UserProject, RoleEnum
+from models import Project, User, UserProject, RoleEnum, Task
 from database import  SessionLocal
 from .auth import get_current_user , check_project_permission
 
@@ -151,3 +151,142 @@ async def add_user_to_project(
     db.commit()
 
     return {"message": f"User {add_user_request.username} added to project successfully"}
+
+
+@router.delete("/{project_id}/members/{user_id}", status_code=status.HTTP_200_OK)
+async def remove_member_from_project(
+        user: user_dependency,
+        db: db_dependency,
+        project_id: int = Path(gt=0),
+        user_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # التحقق من وجود المشروع
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من وجود المستخدم المراد إزالته
+    member_to_remove = db.query(User).filter(User.id == user_id).first()
+    if not member_to_remove:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    # التحقق من أن المستخدم المراد إزالته عضو في المشروع
+    user_project = db.query(UserProject).filter(
+        UserProject.project_id == project_id,
+        UserProject.user_id == user_id
+    ).first()
+
+    if not user_project:
+        raise HTTPException(
+            status_code=400,
+            detail='User is not a member of this project'
+        )
+
+    # التحقق من صلاحيات المستخدم الحالي (مالك المشروع فقط يمكنه الإزالة)
+    if user.get('id') != project.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Only project owner can remove members'
+        )
+
+    # منع إزالة المالك من مشروعه
+    if user_id == project.owner_id:
+        raise HTTPException(
+            status_code=400,
+            detail='Project owner cannot be removed'
+        )
+
+    # جلب جميع المهام المخصصة لهذا العضو في المشروع
+    tasks = db.query(Task).filter(
+        Task.project_id == project_id,
+        Task.worker_id == user_id
+    ).all()
+
+    # فك ارتباط المهام بالعضو
+    for task in tasks:
+        task.worker_id = None
+
+
+    # إزالة العضو من المشروع
+    db.delete(user_project)
+    db.commit()
+
+    return {
+        "message": "Member removed from project successfully",
+        "project_id": project_id,
+        "user_id": user_id,
+        "tasks_unassigned": len(tasks)
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@router.get("/user-projects", status_code=status.HTTP_200_OK)
+async def get_user_projects(
+        user: user_dependency,
+        db: db_dependency
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # جلب جميع المشاريع التي يمتلكها المستخدم
+    owned_projects = db.query(Project).filter(Project.owner_id == user.get('id')).all()
+
+    # جلب جميع المشاريع التي يديرها المستخدم (من خلال جدول UserProject)
+    managed_projects = (
+        db.query(Project)
+        .join(UserProject, Project.id == UserProject.project_id)
+        .join(User, UserProject.user_id == User.id)
+        .filter(
+            User.id == user.get('id'),
+            User.role == RoleEnum.Manager.value
+        )
+        .all()
+    )
+
+    # دمج النتائج مع إزالة التكرارات
+    all_projects = list(set(owned_projects + managed_projects))
+
+    # تحويل النتائج إلى تنسيق مناسب
+    projects_list = []
+    for project in all_projects:
+        # جلب اسم المالك
+        owner = db.query(User).filter(User.id == project.owner_id).first()
+        owner_name = f"{owner.first_name} {owner.last_name}" if owner else "Unknown"
+
+        # جلب عدد المهام في المشروع
+        tasks_count = db.query(Task).filter(Task.project_id == project.id).count()
+
+        projects_list.append({
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "created_at": project.create_date,
+            "owner_id": project.owner_id,
+            "owner_name": owner_name,
+            "is_completed": project.complete,
+            "tasks_count": tasks_count
+        })
+
+    return {"projects": projects_list}

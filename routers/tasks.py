@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette import status
 from database import  SessionLocal
 from models import PriorityEnum, DependencyType, Project, User, Task, TaskStatus, TaskInfo, UserProject, RoleEnum, \
-    Sprint
+    Sprint, Comment, Reply
 from routers.auth import get_current_user, check_project_permission
+from routers.sprints import check_dependency_status
 
 router = APIRouter(
     prefix='/task',
@@ -95,7 +96,7 @@ def check_dependent_tasks(db: Session, completed_task_id: int):
                 db.add(task_info)
 
     db.commit()
-    db.refresh()
+
 
 def check_ss_dependent_tasks(db: Session, started_task_id: int):
     """
@@ -122,7 +123,36 @@ def check_ss_dependent_tasks(db: Session, started_task_id: int):
             db.add(task_info)
 
     db.commit()
-    db.refresh()
+
+
+def check_circular_dependency(db: Session, task_id: int, dependency_id: int) -> bool:
+    """
+    التحقق من وجود اعتمادية دائرية
+    """
+    current = dependency_id
+    visited = set()
+
+    while current:
+        # إذا وصلنا إلى المهمة الأصلية، فهناك اعتمادية دائرية
+        if current == task_id:
+            return True
+
+        # إذا وصلنا إلى مهمة تم زيارتها سابقاً
+        if current in visited:
+            return True
+
+        visited.add(current)
+
+        # جلب المهمة التالية في السلسلة
+        next_task = db.query(Task).filter(Task.id == current).first()
+        if not next_task or not next_task.dependent_on:
+            break
+
+        current = next_task.dependent_on
+
+    return False
+
+
 
 class CreateTaskRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
@@ -131,6 +161,16 @@ class CreateTaskRequest(BaseModel):
     dependency_type: Optional[DependencyType] = DependencyType.NONE
     priority: Optional[PriorityEnum] = PriorityEnum.MEDIUM
 
+
+class UpdateTaskNameRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=100)
+
+class UpdateTaskDependencyRequest(BaseModel):
+    dependent_on: Optional[int] = Field(None, gt=0, description="ID of the task this task depends on")
+    dependency_type: Optional[DependencyType] = Field(DependencyType.NONE, description="Type of dependency")
+
+class AssignTaskRequest(BaseModel):
+    user_id: int = Field(gt=0, description="ID of the user to assign the task to")
 
 @router.post("/{project_id}", status_code=status.HTTP_201_CREATED)
 async def create_task(
@@ -221,7 +261,7 @@ async def create_task(
     }
 
 
-@router.put("/{task_id}/start", status_code=status.HTTP_200_OK)
+@router.put("/start/{task_id}", status_code=status.HTTP_200_OK)
 async def start_task(
         user: user_dependency,
         db: db_dependency,
@@ -301,7 +341,7 @@ async def start_task(
     }
 
 
-@router.put("/{task_id}/mark-testing", status_code=status.HTTP_200_OK)
+@router.put("/mark-testing/{task_id}", status_code=status.HTTP_200_OK)
 async def mark_task_as_testing(
         user: user_dependency,
         db: db_dependency,
@@ -363,7 +403,7 @@ async def mark_task_as_testing(
     }
 
 
-@router.put("/{task_id}/mark-feedback", status_code=status.HTTP_200_OK)
+@router.put("/mark-feedback/{task_id}", status_code=status.HTTP_200_OK)
 async def mark_task_as_feedback(
         user: user_dependency,
         db: db_dependency,
@@ -425,7 +465,7 @@ async def mark_task_as_feedback(
     }
 
 
-@router.put("/{task_id}/mark-complete", status_code=status.HTTP_200_OK)
+@router.put("/mark-complete/{task_id}", status_code=status.HTTP_200_OK)
 async def mark_task_as_complete(
         user: user_dependency,
         db: db_dependency,
@@ -487,6 +527,233 @@ async def mark_task_as_complete(
         "message": "Task marked as complete",
         "task_id": task_id,
         "new_status": TaskStatus.COMPLETE.value
+    }
+
+
+@router.put("/{task_id}/name", status_code=status.HTTP_200_OK)
+async def update_task_name(
+    user: user_dependency,
+    db: db_dependency,
+    update_request: UpdateTaskNameRequest,
+    task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can update task name'
+        )
+
+    # تحديث اسم المهمة
+    task.name = update_request.name
+    db.commit()
+
+    return {"message": "Task name updated successfully"}
+
+
+@router.put("/{task_id}/dependency", status_code=status.HTTP_200_OK)
+async def update_task_dependency(
+        user: user_dependency,
+        db: db_dependency,
+        update_request: UpdateTaskDependencyRequest,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can update task dependencies'
+        )
+
+    # التحقق من المهمة المعتمدة عليها
+    if update_request.dependent_on:
+        dependency_task = db.query(Task).filter(Task.id == update_request.dependent_on).first()
+        if not dependency_task:
+            raise HTTPException(status_code=404, detail='Dependency task not found')
+
+        # التحقق من أن المهمة في نفس المشروع
+        if dependency_task.project_id != task.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail='Dependency task must be in the same project'
+            )
+
+        # التحقق من عدم وجود اعتمادية دائرية
+        if check_circular_dependency(db, task_id, update_request.dependent_on):
+            raise HTTPException(
+                status_code=400,
+                detail='Circular dependency detected'
+            )
+
+    # تحديث الاعتمادية
+    task.dependent_on = update_request.dependent_on
+    task.dependency_type = update_request.dependency_type.value if update_request.dependency_type else None
+
+    # تحديث حالة المهمة بناءً على الاعتمادية الجديدة فقط إذا كانت في سباق نشط
+    if task.sprint_id:
+        sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+        if sprint and sprint.is_active:
+            if task.dependent_on:
+                if check_dependency_status(db, task):
+                    task.status = TaskStatus.AVAILABLE
+                else:
+                    task.status = TaskStatus.WAIT
+            else:
+                task.status = TaskStatus.NOT_AVAILABLE
+
+    # تسجيل تغيير الحالة
+    current_time = datetime.now(timezone.utc)
+    task_info = TaskInfo(
+        task_num=task_id,
+        update_date=current_time,
+        task_status=task.status.value
+    )
+    db.add(task_info)
+
+    db.commit()
+
+    return {"message": "Task dependency updated successfully"}
+
+
+@router.delete("/{task_id}", status_code=status.HTTP_200_OK)
+async def delete_task(
+        user: user_dependency,
+        db: db_dependency,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can delete tasks'
+        )
+
+    # جلب جميع المهام التي تعتمد على هذه المهمة
+    dependent_tasks = db.query(Task).filter(Task.dependent_on == task_id).all()
+
+    # فك ارتباط المهام المعتمدة
+    for dep_task in dependent_tasks:
+        dep_task.dependent_on = None
+
+        # إذا كانت المهمة في سباق نشط، تحديث حالتها
+        if dep_task.sprint_id:
+            sprint = db.query(Sprint).filter(Sprint.id == dep_task.sprint_id).first()
+            if sprint and sprint.is_active:
+                dep_task.status = TaskStatus.AVAILABLE
+
+                # تسجيل تغيير الحالة
+                current_time = datetime.now(timezone.utc)
+                task_info = TaskInfo(
+                    task_num=dep_task.id,
+                    update_date=current_time,
+                    task_status=TaskStatus.AVAILABLE.value
+                )
+                db.add(task_info)
+
+    # حذف سجلات TaskInfo المرتبطة بالمهمة الأصلية
+    db.query(TaskInfo).filter(TaskInfo.task_num == task_id).delete()
+
+    # حذف التعليقات والردود المرتبطة بالمهمة الأصلية
+    comments = db.query(Comment).filter(Comment.task_id == task_id).all()
+    for comment in comments:
+        db.query(Reply).filter(Reply.comment_id == comment.id).delete()
+    db.query(Comment).filter(Comment.task_id == task_id).delete()
+
+    # إذا كانت المهمة في سباق، فك ارتباطها
+    if task.sprint_id:
+        task.sprint_id = None
+
+    # حذف المهمة نفسها
+    db.delete(task)
+    db.commit()
+
+    return {
+        "message": "Task deleted successfully",
+        "task_id": task_id,
+        "project_id": task.project_id,
+        "dependencies_removed": len(dependent_tasks)
+    }
+
+@router.put("/{task_id}/assign", status_code=status.HTTP_200_OK)
+async def assign_task_to_user(
+    user: user_dependency,
+    db: db_dependency,
+    assign_request: AssignTaskRequest,
+    task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can assign tasks'
+        )
+
+    # جلب المستخدم المراد إسناد المهمة إليه
+    assignee = db.query(User).filter(User.id == assign_request.user_id).first()
+    if not assignee:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    # التحقق من أن المستخدم المراد إسناد المهمة له له دور "User"
+    if assignee.role != RoleEnum.User.value:
+        raise HTTPException(
+            status_code=400,
+            detail='Task can only be assigned to users with "User" role'
+        )
+
+    # التحقق من أن المستخدم عضو في المشروع
+    is_member = db.query(UserProject).filter(
+        UserProject.user_id == assign_request.user_id,
+        UserProject.project_id == task.project_id
+    ).first()
+    if not is_member:
+        raise HTTPException(
+            status_code=400,
+            detail='Assigned user is not a member of this project'
+        )
+
+    # تحديث المهمة بإسنادها للمستخدم
+    task.worker_id = assign_request.user_id
+    db.commit()
+
+    return {
+        "message": "Task assigned successfully",
+        "task_id": task_id,
+        "assigned_to": {
+            "user_id": assign_request.user_id,
+            "username": assignee.username
+        }
     }
 
 
