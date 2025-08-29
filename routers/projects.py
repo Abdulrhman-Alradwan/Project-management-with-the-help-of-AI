@@ -1,9 +1,10 @@
+from datetime import timezone, datetime
 from typing import Annotated, Optional
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from starlette import status
-from models import Project, User, UserProject, RoleEnum, Task
+from models import Project, User, UserProject, RoleEnum, Task, TaskStatus
 from database import  SessionLocal
 from .auth import get_current_user , check_project_permission
 
@@ -22,6 +23,13 @@ class ProjectRequest(BaseModel):
 
 class AddUserToProjectRequest(BaseModel):
     username: str = Field(min_length=3, max_length=50)
+
+class LeaveProjectRequest(BaseModel):
+    new_owner_id: Optional[int] = Field(None, gt=0, description="Required if the user is the owner")
+
+
+class UpdateUserStoryPointsRequest(BaseModel):
+    story_points: int = Field(ge=0, le=100, description="Story points must be between 0 and 100")
 
 
 def get_db():
@@ -97,37 +105,30 @@ async def update_project_name(
 
 @router.post("/{project_id}/users", status_code=status.HTTP_201_CREATED)
 async def add_user_to_project(
-    user: user_dependency,
-    db: db_dependency,
-    add_user_request: AddUserToProjectRequest,
-    project_id: int = Path(gt=0)
+        user: user_dependency,
+        db: db_dependency,
+        add_user_request: AddUserToProjectRequest,
+        project_id: int = Path(gt=0)
 ):
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication Failed')
 
-    # التحقق من أن المستخدم هو مدير أو مالك المشروع
+    # التحقق من وجود المشروع
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail='Project not found')
 
-    # استدعاء دالة التحقق من الصلاحيات
-    if not check_project_permission(db, user.get('id'), project_id):
+    # التحقق من أن المستخدم الحالي هو مالك المشروع
+    if user.get('id') != project.owner_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail='Only project owner or assigned managers can add users to the project'
+            detail='Only project owner can add users to the project'
         )
 
     # البحث عن المستخدم المراد إضافته
     user_to_add = db.query(User).filter(User.username == add_user_request.username).first()
     if not user_to_add:
         raise HTTPException(status_code=404, detail='User not found')
-
-    # التحقق من أن المستخدم المضاف ليس مديراً (ما لم يكن المالك نفسه)
-    if user_to_add.role == RoleEnum.Manager.value and project.owner_id != user_to_add.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='Cannot add another manager to the project'
-        )
 
     # التحقق من عدم وجود العلاقة بالفعل
     existing_association = db.query(UserProject).filter(
@@ -141,6 +142,21 @@ async def add_user_to_project(
             detail='User is already associated with this project'
         )
 
+    # التحقق من وجود مدير آخر في المشروع (بخلاف المالك الحالي)
+    if user_to_add.role == RoleEnum.Manager.value:
+        # البحث عن أي مدير آخر في المشروع
+        other_managers = db.query(User).join(UserProject).filter(
+            UserProject.project_id == project_id,
+            User.role == RoleEnum.Manager.value,
+            User.id != user.get('id')  # استثناء المالك الحالي
+        ).count()
+
+        if other_managers > 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Project already has a manager. Cannot add another manager.'
+            )
+
     # إنشاء العلاقة الجديدة
     new_association = UserProject(
         user_id=user_to_add.id,
@@ -148,9 +164,17 @@ async def add_user_to_project(
     )
 
     db.add(new_association)
+
+    # إذا كان المستخدم المضاف مديراً، نقوم بنقل الملكية إليه تلقائياً
+    if user_to_add.role == RoleEnum.Manager.value:
+        project.owner_id = user_to_add.id
+        message = f"Manager {add_user_request.username} added to project and ownership transferred successfully"
+    else:
+        message = f"User {add_user_request.username} added to project successfully"
+
     db.commit()
 
-    return {"message": f"User {add_user_request.username} added to project successfully"}
+    return {"message": message}
 
 
 @router.delete("/{project_id}/members/{user_id}", status_code=status.HTTP_200_OK)
@@ -224,24 +248,6 @@ async def remove_member_from_project(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @router.get("/user-projects", status_code=status.HTTP_200_OK)
 async def get_user_projects(
         user: user_dependency,
@@ -290,3 +296,194 @@ async def get_user_projects(
         })
 
     return {"projects": projects_list}
+
+class LeaveProjectRequest(BaseModel):
+    new_owner_id: Optional[int] = Field(None, gt=0, description="Required if the user is the owner")
+
+
+
+@router.put("/{project_id}/leave", status_code=status.HTTP_200_OK)
+async def leave_project(
+    user: user_dependency,
+    db: db_dependency,
+    request: LeaveProjectRequest,
+    project_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # جلب المشروع
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من أن المستخدم عضو في المشروع
+    user_project = db.query(UserProject).filter(
+        UserProject.user_id == user.get('id'),
+        UserProject.project_id == project_id
+    ).first()
+    if not user_project:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='You are not a member of this project'
+        )
+
+    # إذا كان المستخدم هو المالك
+    if project.owner_id == user.get('id'):
+        # يجب تقديم معرف المالك الجديد
+        if request.new_owner_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='You must specify a new owner before leaving the project'
+            )
+
+        # التحقق من أن المالك الجديد موجود
+        new_owner = db.query(User).filter(User.id == request.new_owner_id).first()
+        if not new_owner:
+            raise HTTPException(status_code=404, detail='New owner not found')
+
+        # التحقق من أن المالك الجديد عضو في المشروع
+        new_owner_membership = db.query(UserProject).filter(
+            UserProject.user_id == request.new_owner_id,
+            UserProject.project_id == project_id
+        ).first()
+        if not new_owner_membership:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='New owner must be a member of the project'
+            )
+
+        # التحقق من أن المالك الجديد ليس المستخدم الحالي
+        if request.new_owner_id == user.get('id'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='You cannot transfer ownership to yourself'
+            )
+
+        # نقل الملكية
+        project.owner_id = request.new_owner_id
+
+    # فك ارتباط المستخدم من المهام المسندة إليه في هذا المشروع
+    tasks = db.query(Task).filter(
+        Task.project_id == project_id,
+        Task.worker_id == user.get('id')
+    ).all()
+
+    for task in tasks:
+        task.worker_id = None
+
+    # إزالة المستخدم من المشروع
+    db.delete(user_project)
+    db.commit()
+
+    return {"message": "You have left the project successfully"}
+
+
+@router.put("/{project_id}/complete", status_code=status.HTTP_200_OK)
+async def complete_project(
+    user: user_dependency,
+    db: db_dependency,
+    project_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # جلب المشروع
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من الصلاحيات (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), project_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Only project owner or assigned managers can complete the project'
+        )
+
+    # التحقق من أن المشروع ليس مكتملاً بالفعل
+    if project.complete:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Project is already completed'
+        )
+
+    # التحقق من أن جميع مهام المشروع مكتملة
+    incomplete_tasks = db.query(Task).filter(
+        Task.project_id == project_id,
+        Task.status != TaskStatus.COMPLETE
+    ).all()
+
+    if incomplete_tasks:
+        incomplete_task_ids = [task.id for task in incomplete_tasks]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Cannot complete project. Incomplete tasks found: {incomplete_task_ids}'
+        )
+
+    # تحديث المشروع ليصبح مكتملاً وتسجيل تاريخ الانتهاء
+    project.complete = True
+    project.end_date = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "message": "Project marked as complete",
+        "project_id": project_id,
+        "end_date": project.end_date
+    }
+
+@router.put("/{project_id}/members/{user_id}/story-points", status_code=status.HTTP_200_OK)
+async def update_user_story_points(
+    user: user_dependency,
+    db: db_dependency,
+    update_request: UpdateUserStoryPointsRequest,
+    project_id: int = Path(gt=0),
+    user_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication Failed')
+
+    # التحقق من وجود المشروع
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail='Project not found')
+
+    # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), project_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Only project owner or assigned managers can update story points'
+        )
+
+    # التحقق من وجود المستخدم المراد تعديله
+    user_to_update = db.query(User).filter(User.id == user_id).first()
+    if not user_to_update:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    # التحقق من أن المستخدم المراد تعديله من نوع "User"
+    if user_to_update.role != RoleEnum.User.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Can only assign story points to users with role "User"'
+        )
+
+    # التحقق من أن المستخدم عضو في المشروع
+    user_project = db.query(UserProject).filter(
+        UserProject.user_id == user_id,
+        UserProject.project_id == project_id
+    ).first()
+    if not user_project:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='User is not a member of this project'
+        )
+
+    # تحديث story points
+    user_project.story_points = update_request.story_points
+    db.commit()
+
+    return {
+        "message": "User story points updated successfully",
+        "project_id": project_id,
+        "user_id": user_id,
+        "story_points": user_project.story_points
+    }

@@ -1,16 +1,17 @@
 from datetime import timedelta, datetime, timezone
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Optional , List
 from fastapi import APIRouter, Depends, HTTPException , UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette import status
-from models import User, RoleEnum, GenderEnum, Project, UserProject
+from models import User, RoleEnum, GenderEnum, Project, UserProject, ExperienceEnum
 from passlib.context import CryptContext
 from database import  SessionLocal
 from fastapi.security import OAuth2PasswordRequestForm , OAuth2PasswordBearer
 from jose import jwt , JWTError
 import os
+import json
 
 
 
@@ -43,6 +44,24 @@ class CreateUserRequest(BaseModel):
     username : str = Field(min_length=3 , max_length=20)
     gender: GenderEnum
     age : int = Field(gt=17, lt=75)
+    experience: ExperienceEnum
+    skills: Optional[List[str]] = None
+
+    class Config:
+        use_enum_values = True
+
+
+
+class UpdateUserRequest(BaseModel):
+    first_name: Optional[str] = Field(None, min_length=3, max_length=20)
+    last_name: Optional[str] = Field(None, min_length=3, max_length=20)
+    email: Optional[str] = None
+    job_title: Optional[str] = None
+    username: Optional[str] = Field(None, min_length=3, max_length=20)
+    gender: Optional[GenderEnum] = None
+    age: Optional[int] = Field(None, gt=17, lt=75)
+    experience: Optional[ExperienceEnum] = None
+    skills: Optional[List[str]] = None
 
     class Config:
         use_enum_values = True
@@ -123,6 +142,9 @@ def check_project_permission(db: Session, user_id: int, project_id: int):
 async def create_user(db : db_dependency ,
                       create_user_request : CreateUserRequest):
 
+    skills_str = None
+    if create_user_request.skills:
+        skills_str = json.dumps(create_user_request.skills)
 
     create_user_model = User(
 
@@ -134,7 +156,9 @@ async def create_user(db : db_dependency ,
         job_title = create_user_request.job_title ,
         username = create_user_request.username ,
         gender=create_user_request.gender,
-        age = create_user_request.age
+        age = create_user_request.age,
+        experience=create_user_request.experience,
+        skills=skills_str
 
     )
 
@@ -196,3 +220,50 @@ async def upload_profile_picture(
     db.commit()
 
     return {"message": "Profile picture updated successfully", "file_path": db_file_path}
+
+
+@router.put("/users/{user_id}", status_code=status.HTTP_200_OK)
+async def update_user(
+        user_id: int,
+        update_data: UpdateUserRequest,
+        db: db_dependency,
+        current_user: dict = Depends(get_current_user)
+):
+    # التحقق من وجود المستخدم
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # التحقق من الصلاحية (يمكن للمستخدم تعديل بياناته فقط - لا يسمح للمديرين أو الآخرين)
+    if current_user['id'] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to update this user")
+
+    # التحقق من عدم تكرار اسم المستخدم إذا تم تحديثه
+    if update_data.username and update_data.username != user.username:
+        existing_user = db.query(User).filter(User.username == update_data.username, User.id != user_id).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already exists")
+
+    # التحقق من عدم تكرار البريد الإلكتروني إذا تم تحديثه
+    if update_data.email and update_data.email != user.email:
+        existing_email = db.query(User).filter(User.email == update_data.email, User.id != user_id).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already exists")
+
+    # تحديث الحقول المرسلة فقط
+    update_dict = update_data.dict(exclude_unset=True)
+
+    if 'skills' in update_dict:
+        # تحويل قائمة المهارات إلى سلسلة JSON
+        update_dict['skills'] = json.dumps(update_dict['skills']) if update_dict['skills'] else None
+
+    # تحديث الحقول
+    for field, value in update_dict.items():
+        setattr(user, field, value)
+
+    try:
+        db.commit()
+        return {"message": "User updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Error updating user: {str(e)}")

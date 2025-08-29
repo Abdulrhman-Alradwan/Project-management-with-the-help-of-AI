@@ -118,7 +118,6 @@ async def add_task_to_epic(
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication Failed')
 
-
     epic = db.query(Epic).filter(Epic.id == epic_id).first()
     if not epic:
         raise HTTPException(status_code=404, detail='Epic not found')
@@ -133,6 +132,20 @@ async def add_task_to_epic(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Task does not belong to the same project as the epic'
+        )
+
+    # التحقق من أن المهمة ليست مضافَة إلى أي epic آخر
+    if task.epic_id is not None and task.epic_id != epic_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Task is already assigned to another epic'
+        )
+
+    # التحقق من أن المهمة ليست مضافَة بالفعل إلى نفس الepic
+    if task.epic_id == epic_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Task is already assigned to this epic'
         )
 
     # التحقق من صلاحيات المستخدم (أنه مدير أو مالك المشروع)

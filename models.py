@@ -21,12 +21,6 @@ class PriorityEnum(str, PyEnum):
     MEDIUM = "medium"
     LOW = "low"
 
-class SprintDuration(PyEnum):
-    ONE_WEEK = "1week"
-    TWO_WEEKS = "2weeks"
-    THREE_WEEKS = "3weeks"
-    FOUR_WEEKS = "4weeks"
-
 
 class TaskStatus(str, PyEnum):
     NOT_AVAILABLE = "not available"
@@ -42,7 +36,10 @@ class DependencyType(str, PyEnum):
     FS = "FS"  # Finish-to-Start
     SS = "SS"  # Start-to-Start
 
-
+class ExperienceEnum(str, PyEnum):
+    JUNIOR = "junior"
+    MID = "mid"
+    SENIOR = "senior"
 
 
 class User(Base):
@@ -59,6 +56,9 @@ class User(Base):
     username = Column(String,unique=True,nullable=False)
     gender = Column(Enum(GenderEnum), nullable=False)
     age = Column(Integer,nullable=False)
+    experience = Column(Enum(ExperienceEnum), nullable=True)
+    skills = Column(String, nullable=True)
+
 
     owned_projects = relationship("Project", back_populates="owner")
     projects = relationship("UserProject", back_populates="user")
@@ -80,6 +80,7 @@ class User(Base):
         if not (18 <= age <= 74):
             raise ValueError('Age must be between 18 and 75 years')
         return age
+
 
 
 
@@ -109,8 +110,8 @@ class Task(Base):
     name = Column(String,nullable=False)
     create_date = Column(DateTime, default=datetime.now(timezone.utc))
     """start_date = Column(DateTime, nullable=False)
-    end_date = Column(DateTime, nullable=True)
-    deadline = Column(DateTime, nullable=True)"""
+    end_date = Column(DateTime, nullable=True)"""
+    deadline = Column(DateTime, nullable=True)
     status = Column(Enum(TaskStatus), default=TaskStatus.NOT_AVAILABLE)
     dependent_on = Column(Integer,nullable=True)
     dependency_type = Column(Enum(DependencyType), default=DependencyType.NONE)
@@ -120,6 +121,8 @@ class Task(Base):
     sprint_id = Column(Integer , ForeignKey('sprint.id'),nullable=True)
     project_id = Column(Integer, ForeignKey('project.id'),nullable=False)
     epic_id = Column(Integer,ForeignKey('epic.id'),default=None)
+    story_points = Column(Integer, default=1)
+    required_skills = Column(String, nullable=True)
 
     worker = relationship("User", back_populates="tasks")
     project = relationship("Project", back_populates="tasks")
@@ -145,7 +148,7 @@ class Sprint(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
-    duration = Column(Enum(SprintDuration), nullable=False)
+    duration = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.now(timezone.utc))  # وقت الإنشاء
     start_date = Column(DateTime, nullable=True)  # null حتى يتم الإطلاق
     end_date = Column(DateTime, nullable=True)  # null حتى يتم الإطلاق
@@ -175,9 +178,17 @@ class UserProject(Base):
 
     user_id = Column(Integer, ForeignKey('user.id'), primary_key=True)
     project_id = Column(Integer, ForeignKey('project.id'), primary_key=True)
+    story_points = Column(Integer, default=0)
+    workload = Column(Integer, default=0)
 
     user = relationship("User", back_populates="projects")
     project = relationship("Project", back_populates="users")
+
+    @validates('workload')
+    def validate_workload(self, key, workload):
+        if not (0 <= workload <= 100):
+            raise ValueError('Workload must be between 0 and 100')
+        return workload
 
 
 class Comment(Base):

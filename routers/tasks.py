@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, Optional, List
+
+
+from pydantic import BaseModel, Field, validator
 from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException
 from starlette import status
@@ -10,6 +12,9 @@ from models import PriorityEnum, DependencyType, Project, User, Task, TaskStatus
     Sprint, Comment, Reply
 from routers.auth import get_current_user, check_project_permission
 from routers.sprints import check_dependency_status
+import json
+
+
 
 router = APIRouter(
     prefix='/task',
@@ -127,30 +132,81 @@ def check_ss_dependent_tasks(db: Session, started_task_id: int):
 
 def check_circular_dependency(db: Session, task_id: int, dependency_id: int) -> bool:
     """
-    التحقق من وجود اعتمادية دائرية
+    التحقق من وجود اعتمادية دائرية باستخدام DFS
     """
-    current = dependency_id
+    if not dependency_id:
+        return False
+
+    # جلب معلومات المهمة الحالية
+    current_task = db.query(Task).filter(Task.id == task_id).first()
+    if not current_task:
+        return False
+
+    # إنشاء قاموس لتخزين تبعيات المهام
+    dependency_graph = {}
+
+    # جمع جميع التبعيات في المشروع
+    all_tasks = db.query(Task).filter(Task.project_id == current_task.project_id).all()
+    for t in all_tasks:
+        if t.dependent_on:
+            if t.id not in dependency_graph:
+                dependency_graph[t.id] = []
+            dependency_graph[t.id].append(t.dependent_on)
+
+    # إضافة التبعية الجديدة إلى الرسم البياني
+    if task_id not in dependency_graph:
+        dependency_graph[task_id] = []
+    dependency_graph[task_id].append(dependency_id)
+
+    # استخدام DFS للكشف عن الحلقات
     visited = set()
+    recursion_stack = set()
 
-    while current:
-        # إذا وصلنا إلى المهمة الأصلية، فهناك اعتمادية دائرية
-        if current == task_id:
-            return True
+    def has_cycle(node):
+        visited.add(node)
+        recursion_stack.add(node)
 
-        # إذا وصلنا إلى مهمة تم زيارتها سابقاً
-        if current in visited:
-            return True
+        if node in dependency_graph:
+            for neighbor in dependency_graph[node]:
+                if neighbor not in visited:
+                    if has_cycle(neighbor):
+                        return True
+                elif neighbor in recursion_stack:
+                    return True
 
-        visited.add(current)
+        recursion_stack.remove(node)
+        return False
 
-        # جلب المهمة التالية في السلسلة
-        next_task = db.query(Task).filter(Task.id == current).first()
-        if not next_task or not next_task.dependent_on:
-            break
+    # التحقق من وجود حلقة بدءاً من المهمة الحالية
+    return has_cycle(task_id)
 
-        current = next_task.dependent_on
+def calculate_user_workload(db: Session, user_id: int, project_id: int):
+    """
+    حساب الـ Workload للمستخدم في المشروع بناءً على مجموع نقاط المهام المسندة إليه
+    """
+    # حساب مجموع story points للمهام المسندة للمستخدم في المشروع
+    total_assigned_points = db.query(
+        db.func.coalesce(db.func.sum(Task.story_points), 0)
+    ).filter(
+        Task.worker_id == user_id,
+        Task.project_id == project_id,
+        Task.status.notin_([TaskStatus.COMPLETE, TaskStatus.NOT_AVAILABLE])
+    ).scalar()
 
-    return False
+    # حساب الـ Workload كنسبة مئوية (نفترض أن السعة القصوى هي 40 نقطة = 100%)
+    workload_percentage = min(100, int((total_assigned_points / 40) * 100))
+
+    # تحديث الـ Workload في جدول UserProject
+    user_project = db.query(UserProject).filter(
+        UserProject.user_id == user_id,
+        UserProject.project_id == project_id
+    ).first()
+
+    if user_project:
+        user_project.workload = workload_percentage
+        db.commit()
+
+    return workload_percentage
 
 
 
@@ -160,13 +216,36 @@ class CreateTaskRequest(BaseModel):
     dependent_on: Optional[int] = None
     dependency_type: Optional[DependencyType] = DependencyType.NONE
     priority: Optional[PriorityEnum] = PriorityEnum.MEDIUM
+    required_skills: Optional[List[str]] = None
+    story_points: Optional[int] = Field(1, ge=1, le=40)
+    deadline: Optional[datetime] = None
 
+    @validator('deadline')
+    def validate_deadline(cls, v):
+        if v and v <= datetime.now():
+            raise ValueError('Deadline must be in the future')
+        return v
+class UpdateTaskRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=3, max_length=100)
+    deadline: Optional[datetime] = None
+    required_skills: Optional[List[str]] = None
+
+    @validator('deadline')
+    def validate_deadline(cls, v):
+        if v and v <= datetime.now():
+            raise ValueError('Deadline must be in the future')
+        return v
+
+
+
+class UpdateStoryPointsRequest(BaseModel):
+    story_points: int = Field(ge=1, le=40, description="Story points must be between 1 and 40")
 
 class UpdateTaskNameRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
 
 class UpdateTaskDependencyRequest(BaseModel):
-    dependent_on: Optional[int] = Field(None, gt=0, description="ID of the task this task depends on")
+    dependent_on: Optional[int] = Field(None, ge=0, description="ID of the task this task depends on. Use 0 to remove dependency.")
     dependency_type: Optional[DependencyType] = Field(DependencyType.NONE, description="Type of dependency")
 
 class AssignTaskRequest(BaseModel):
@@ -227,21 +306,29 @@ async def create_task(
                 detail='Dependent task must be in the same project'
             )
 
-    # إنشاء المهمة مع التحويل الصحيح للـ Enum
-    task = Task(
-        name=task_request.name,
-        status=TaskStatus.NOT_AVAILABLE.value,
-        project_id=project_id,
-        worker_id=task_request.worker_id,
-        dependent_on=task_request.dependent_on,
-        dependency_type=task_request.dependency_type.value if task_request.dependency_type else None,
-        priority=task_request.priority.value.lower() if task_request.priority else PriorityEnum.MEDIUM.value.lower(),
-        create_date=datetime.now(timezone.utc)
-    )
+        # تحويل قائمة المهارات إلى سلسلة JSON للتخزين
+        required_skills_str = None
+        if task_request.required_skills:
+            required_skills_str = json.dumps(task_request.required_skills)
 
-    db.add(task)
-    db.commit()
-    db.refresh(task)
+        # إنشاء المهمة مع الحقول الجديدة
+        task = Task(
+            name=task_request.name,
+            status=TaskStatus.NOT_AVAILABLE.value,
+            project_id=project_id,
+            worker_id=task_request.worker_id,
+            dependent_on=task_request.dependent_on,
+            dependency_type=task_request.dependency_type.value if task_request.dependency_type else None,
+            priority=task_request.priority.value.lower() if task_request.priority else PriorityEnum.MEDIUM.value.lower(),
+            create_date=datetime.now(timezone.utc),
+            required_skills=required_skills_str,
+            story_points=task_request.story_points if task_request.story_points else 1,
+            deadline=task_request.deadline
+        )
+
+        db.add(task)
+        db.commit()
+        db.refresh(task)
 
     # إنشاء سجل المهمة
     task_info = TaskInfo(
@@ -257,7 +344,9 @@ async def create_task(
         "task_id": task.id,
         "status": task.status,
         "worker_id": task.worker_id,
-        "priority": task.priority
+        "priority": task.priority,
+        "story_points": task.story_points,
+        "deadline": task.deadline
     }
 
 
@@ -507,6 +596,9 @@ async def mark_task_as_complete(
             detail='Task is not in an active sprint'
         )
 
+    # حفظ معرف العامل قبل تغيير الحالة (لإعادة حساب الـ Workload)
+    worker_id = task.worker_id
+
     # تغيير حالة المهمة
     task.status = TaskStatus.COMPLETE
 
@@ -523,10 +615,15 @@ async def mark_task_as_complete(
     # التحقق من تأثير إكمال المهمة على المهام المعتمدة عليها
     check_dependent_tasks(db, task_id)
 
+    # إعادة حساب الـ Workload للعامل إذا كانت المهمة مسندة له
+    if worker_id:
+        calculate_user_workload(db, worker_id, task.project_id)
+
     return {
         "message": "Task marked as complete",
         "task_id": task_id,
-        "new_status": TaskStatus.COMPLETE.value
+        "new_status": TaskStatus.COMPLETE.value,
+        "worker_id": worker_id
     }
 
 
@@ -581,7 +678,13 @@ async def update_task_dependency(
             detail='Only project owner or assigned managers can update task dependencies'
         )
 
-    # التحقق من المهمة المعتمدة عليها
+    # معالجة حالة إلغاء التبعية (عند إدخال 0)
+    if update_request.dependent_on == 0:
+        # تحويل 0 إلى None لإلغاء التبعية
+        update_request.dependent_on = None
+        update_request.dependency_type = DependencyType.NONE
+
+    # التحقق من المهمة المعتمدة عليها (إذا كانت غير null)
     if update_request.dependent_on:
         dependency_task = db.query(Task).filter(Task.id == update_request.dependent_on).first()
         if not dependency_task:
@@ -598,24 +701,28 @@ async def update_task_dependency(
         if check_circular_dependency(db, task_id, update_request.dependent_on):
             raise HTTPException(
                 status_code=400,
-                detail='Circular dependency detected'
+                detail='Circular dependency detected in the dependency chain'
             )
 
     # تحديث الاعتمادية
     task.dependent_on = update_request.dependent_on
     task.dependency_type = update_request.dependency_type.value if update_request.dependency_type else None
 
-    # تحديث حالة المهمة بناءً على الاعتمادية الجديدة فقط إذا كانت في سباق نشط
+    # تحديث حالة المهمة بناءً على الاعتمادية الجديدة
     if task.sprint_id:
         sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
         if sprint and sprint.is_active:
-            if task.dependent_on:
+            if task.dependent_on:  # إذا كانت هناك تبعية جديدة
                 if check_dependency_status(db, task):
                     task.status = TaskStatus.AVAILABLE
                 else:
                     task.status = TaskStatus.WAIT
-            else:
-                task.status = TaskStatus.NOT_AVAILABLE
+            else:  # إذا تم إلغاء التبعية
+                # تحويل الحالة من WAIT إلى AVAILABLE إذا كانت في سباق نشط
+                if task.status == TaskStatus.WAIT:
+                    task.status = TaskStatus.AVAILABLE
+                else:
+                    task.status = TaskStatus.NOT_AVAILABLE
 
     # تسجيل تغيير الحالة
     current_time = datetime.now(timezone.utc)
@@ -628,7 +735,10 @@ async def update_task_dependency(
 
     db.commit()
 
-    return {"message": "Task dependency updated successfully"}
+    if update_request.dependent_on is None:
+        return {"message": "Task dependency removed successfully"}
+    else:
+        return {"message": "Task dependency updated successfully"}
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_200_OK)
@@ -651,6 +761,19 @@ async def delete_task(
             status_code=403,
             detail='Only project owner or assigned managers can delete tasks'
         )
+
+    # التحقق من أن المهمة ليست في سباق مكتمل
+    if task.sprint_id:
+        sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+        if sprint and sprint.is_completed:
+            raise HTTPException(
+                status_code=400,
+                detail='Cannot delete task from a completed sprint'
+            )
+
+    # حفظ معرف العامل قبل حذف المهمة (لإعادة حساب الـ Workload)
+    worker_id = task.worker_id
+    project_id = task.project_id
 
     # جلب جميع المهام التي تعتمد على هذه المهمة
     dependent_tasks = db.query(Task).filter(Task.dependent_on == task_id).all()
@@ -691,11 +814,16 @@ async def delete_task(
     db.delete(task)
     db.commit()
 
+    # إعادة حساب الـ Workload للعامل إذا كانت المهمة مسندة له
+    if worker_id:
+        calculate_user_workload(db, worker_id, project_id)
+
     return {
         "message": "Task deleted successfully",
         "task_id": task_id,
-        "project_id": task.project_id,
-        "dependencies_removed": len(dependent_tasks)
+        "project_id": project_id,
+        "dependencies_removed": len(dependent_tasks),
+        "worker_id": worker_id
     }
 
 @router.put("/{task_id}/assign", status_code=status.HTTP_200_OK)
@@ -712,6 +840,15 @@ async def assign_task_to_user(
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن المهمة ليست في سباق نشط (لا يمكن إسناد مهام في سباق نشط)
+    if task.sprint_id:
+        sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+        if sprint and sprint.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail='Cannot assign tasks that are in an active sprint'
+            )
 
     # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
     if not check_project_permission(db, user.get('id'), task.project_id):
@@ -743,9 +880,22 @@ async def assign_task_to_user(
             detail='Assigned user is not a member of this project'
         )
 
+    # حساب الـ Workload الحالي للمستخدم
+    current_workload = calculate_user_workload(db, assign_request.user_id, task.project_id)
+
+    # التحقق من أن إضافة المهمة لن تتجاوز الحد الأقصى للـ Workload (100%)
+    if current_workload + task.story_points > 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Cannot assign task. User workload would exceed 100% (current: {current_workload}%, task: {task.story_points}%)'
+        )
+
     # تحديث المهمة بإسنادها للمستخدم
     task.worker_id = assign_request.user_id
     db.commit()
+
+    # إعادة حساب الـ Workload بعد إسناد المهمة
+    new_workload = calculate_user_workload(db, assign_request.user_id, task.project_id)
 
     return {
         "message": "Task assigned successfully",
@@ -753,7 +903,138 @@ async def assign_task_to_user(
         "assigned_to": {
             "user_id": assign_request.user_id,
             "username": assignee.username
-        }
+        },
+        "workload_before": current_workload,
+        "workload_after": new_workload
     }
 
 
+@router.put("/{task_id}/story-points", status_code=status.HTTP_200_OK)
+async def update_task_story_points(
+        user: user_dependency,
+        db: db_dependency,
+        update_request: UpdateStoryPointsRequest,
+        task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من أن المهمة ليست في سباق نشط (لا يمكن تعديل نقاط المهام في سباق نشط)
+    if task.sprint_id:
+        sprint = db.query(Sprint).filter(Sprint.id == task.sprint_id).first()
+        if sprint and sprint.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail='Cannot update story points for tasks in an active sprint'
+            )
+
+    # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can update story points'
+        )
+
+    # حفظ نقاط المهمة القديمة لحساب التغيير في الـ Workload
+    old_story_points = task.story_points
+
+    # تحديث story points
+    task.story_points = update_request.story_points
+    db.commit()
+
+    # إذا كانت المهمة مسندة لمستخدم، إعادة حساب الـ Workload
+    if task.worker_id:
+        calculate_user_workload(db, task.worker_id, task.project_id)
+
+    return {
+        "message": "Task story points updated successfully",
+        "task_id": task_id,
+        "old_story_points": old_story_points,
+        "new_story_points": task.story_points
+    }
+
+
+@router.put("/{task_id}/unassign", status_code=status.HTTP_200_OK)
+async def unassign_task(
+    user: user_dependency,
+    db: db_dependency,
+    task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم (مالك أو مدير المشروع)
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can unassign tasks'
+        )
+
+    # حفظ معرف المستخدم المسند إليه المهمة قبل إلغاء الإسناد
+    old_worker_id = task.worker_id
+
+    # إلغاء إسناد المهمة
+    task.worker_id = None
+    db.commit()
+
+    # إذا كانت المهمة مسندة سابقاً لمستخدم، إعادة حساب الـ Workload
+    if old_worker_id:
+        calculate_user_workload(db, old_worker_id, task.project_id)
+
+    return {
+        "message": "Task unassigned successfully",
+        "task_id": task_id,
+        "previous_worker_id": old_worker_id
+    }
+
+
+@router.put("/{task_id}", status_code=status.HTTP_200_OK)
+async def update_task(
+    user: user_dependency,
+    db: db_dependency,
+    update_data: UpdateTaskRequest,
+    task_id: int = Path(gt=0)
+):
+    if user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    # جلب المهمة
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+
+    # التحقق من صلاحيات المستخدم
+    if not check_project_permission(db, user.get('id'), task.project_id):
+        raise HTTPException(
+            status_code=403,
+            detail='Only project owner or assigned managers can update tasks'
+        )
+
+    # تحديث الحقول المرسلة فقط
+    update_dict = update_data.dict(exclude_unset=True)
+
+    if 'required_skills' in update_dict:
+        # تحويل قائمة المهارات إلى سلسلة JSON
+        update_dict['required_skills'] = json.dumps(update_dict['required_skills']) if update_dict['required_skills'] else None
+
+    # تحديث الحقول
+    for field, value in update_dict.items():
+        setattr(task, field, value)
+
+    try:
+        db.commit()
+        db.refresh(task)
+        return {"message": "Task updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Error updating task: {str(e)}")

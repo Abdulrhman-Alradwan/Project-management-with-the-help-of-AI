@@ -1,6 +1,6 @@
 import asyncio
 from datetime import timedelta, datetime, timezone, time
-from typing import Annotated
+from typing import Annotated , List
 from pydantic import BaseModel, Field
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
@@ -8,7 +8,7 @@ from fastapi import APIRouter , Depends
 from database import  SessionLocal
 from .auth import get_current_user , check_project_permission
 from fastapi import status, HTTPException, Path
-from models import Epic, Project, SprintDuration, Sprint, Task, TaskStatus, TaskInfo, DependencyType
+from models import Epic, Project,Sprint, Task, TaskStatus, TaskInfo, DependencyType
 
 router = APIRouter(
     prefix='/sprint',
@@ -19,9 +19,9 @@ router = APIRouter(
 
 class CreateSprintRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
-    duration: SprintDuration
 
-
+class UpdateSprintNameRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=100)
 
 def get_db():
     db = SessionLocal()
@@ -106,6 +106,54 @@ def check_dependency_status(db: Session, task: Task) -> bool:
     return False
 
 
+def check_dependency_chain(db: Session, task: Task, sprint_id: int, visited=None) -> List[str]:
+    """
+    تحقق من سلسلة تبعيات المهمة بشكل متكرر وتعيد قائمة بالأخطاء.
+    """
+    if visited is None:
+        visited = set()
+
+    errors = []
+
+    # تجنب التكرار والتبعيات الدائرية
+    if task.id in visited:
+        return errors
+    visited.add(task.id)
+
+    if task.dependent_on:
+        dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+
+        if not dependency_task:
+            errors.append(f"Task {task.id} depends on non-existent task {task.dependent_on}")
+            return errors
+
+        # التحقق من أن المهمة المعتمدة عليها إما في نفس السباق أو مستوفية الشروط
+        if dependency_task.sprint_id != sprint_id:
+            # إذا لم تكن في السباق، يجب أن تكون مستوفية للشروط حسب نوع التبعية
+            if task.dependency_type == DependencyType.FS:
+                if dependency_task.status != TaskStatus.COMPLETE:
+                    errors.append(
+                        f"Task {task.id} depends on task {dependency_task.id} "
+                        f"which is not in this sprint and not complete ({dependency_task.status})"
+                    )
+            elif task.dependency_type == DependencyType.SS:
+                if dependency_task.status not in [
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.TESTING,
+                    TaskStatus.FEEDBACK,
+                    TaskStatus.COMPLETE
+                ]:
+                    errors.append(
+                        f"Task {task.id} depends on task {dependency_task.id} "
+                        f"which is not in this sprint and not started ({dependency_task.status})"
+                    )
+        else:
+            # إذا كانت في السباق، تحقق من تبعياتها أيضًا
+            dep_errors = check_dependency_chain(db, dependency_task, sprint_id, visited)
+            errors.extend(dep_errors)
+
+    return errors
+
 @router.post("/{project_id}", status_code=status.HTTP_201_CREATED)
 async def create_sprint(
         user: user_dependency,
@@ -129,10 +177,10 @@ async def create_sprint(
             detail=f'Cannot create new sprint. There is an uncompleted sprint (ID: {existing_uncompleted_sprint.id}) in this project'
         )
 
-    # إنشاء Sprint جديد
+    # إنشاء Sprint جديد مع مدة ثابتة (أسبوعين)
     sprint = Sprint(
         name=sprint_request.name,
-        duration=sprint_request.duration,
+        duration="2weeks",  # تعيين مدة ثابتة
         project_id=project_id,
         is_active=False,  # غير نشط عند الإنشاء
         is_completed=False  # غير مكتمل عند الإنشاء
@@ -148,8 +196,7 @@ async def create_sprint(
 
 
 
-class UpdateSprintNameRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=100)
+
 
 @router.put("/{sprint_id}/name", status_code=status.HTTP_200_OK)
 async def update_sprint_name(
@@ -191,12 +238,13 @@ async def update_sprint_name(
 class AddTaskToSprintRequest(BaseModel):
     task_id: int = Field(gt=0, description="Task ID to be added")
 
+
 @router.post("/{sprint_id}/tasks", status_code=status.HTTP_200_OK)
 async def add_task_to_sprint(
-    user: user_dependency,
-    db: db_dependency,
-    request: AddTaskToSprintRequest,
-    sprint_id: int = Path(gt=0)
+        user: user_dependency,
+        db: db_dependency,
+        request: AddTaskToSprintRequest,
+        sprint_id: int = Path(gt=0)
 ):
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication required')
@@ -230,6 +278,13 @@ async def add_task_to_sprint(
         raise HTTPException(
             status_code=400,
             detail='Cannot add tasks to a completed sprint'
+        )
+
+    # الشرط الجديد: التحقق من أن الsprint غير نشط
+    if sprint.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail='Cannot add tasks to an active sprint'
         )
 
     # التحقق من أن حالة المهمة ليست complete
@@ -282,11 +337,11 @@ async def launch_sprint(
     # جلب مهام الـ Sprint
     tasks = db.query(Task).filter(Task.sprint_id == sprint_id).all()
 
-    # التحقق من أن الـ Sprint يحتوي على 5 مهام على الأقل
-    if len(tasks) < 5:
+    # التحقق من أن الـ Sprint ليس فارغاً (يحتوي على مهمة واحدة على الأقل)
+    if len(tasks) == 0:
         raise HTTPException(
             status_code=400,
-            detail='Sprint must contain at least 5 tasks'
+            detail='Cannot launch an empty sprint. Sprint must contain at least one task'
         )
 
     # التحقق من أن جميع المهام مسندة لمستخدم
@@ -298,23 +353,17 @@ async def launch_sprint(
             detail=f'Unassigned tasks found: {unassigned_ids}'
         )
 
-    # التحقق الجديد: المهام المعتمدة عليها يجب أن تكون في نفس الـ Sprint أو مكتملة
+    # التحقق من سلسلة التبعيات الكاملة لجميع المهام
     dependency_errors = []
+    visited_tasks = set()
+
     for task in tasks:
-        if task.dependent_on:
-            dependency_task = db.query(Task).filter(Task.id == task.dependent_on).first()
+        # التحقق من سلسلة التبعيات لهذه المهمة
+        task_errors = check_dependency_chain(db, task, sprint_id, visited_tasks.copy())
+        dependency_errors.extend(task_errors)
 
-            if not dependency_task:
-                dependency_errors.append(f"Task {task.id} depends on non-existent task {task.dependent_on}")
-                continue
-
-            # التحقق من أن المهمة التابعة إما في نفس الـ Sprint أو مكتملة
-            if dependency_task.sprint_id != sprint_id and dependency_task.status != TaskStatus.COMPLETE:
-                dependency_errors.append(
-                    f"Task {task.id} depends on task {task.dependent_on} "
-                    f"which is not in this sprint ({dependency_task.sprint_id}) "
-                    f"and not complete ({dependency_task.status})"
-                )
+    # إزالة التكرارات من الأخطاء
+    dependency_errors = list(set(dependency_errors))
 
     if dependency_errors:
         raise HTTPException(
@@ -347,15 +396,8 @@ async def launch_sprint(
             )
             db.add(task_info)
 
-    # حساب وقت الانتهاء
-    duration_mapping = {
-        SprintDuration.ONE_WEEK: timedelta(weeks=1),
-        SprintDuration.TWO_WEEKS: timedelta(weeks=2),
-        SprintDuration.THREE_WEEKS: timedelta(weeks=3),
-        SprintDuration.FOUR_WEEKS: timedelta(weeks=4)
-    }
-
-    duration_delta = duration_mapping[sprint.duration]
+    # حساب وقت الانتهاء (أسبوعين من الوقت الحالي)
+    duration_delta = timedelta(weeks=2)  # مدة ثابتة
 
     sprint.start_date = current_time
     sprint.end_date = current_time + duration_delta
@@ -369,7 +411,6 @@ async def launch_sprint(
         "end_date": sprint.end_date.isoformat(),
         "tasks_updated": len(tasks) - len([t for t in tasks if t.status in [TaskStatus.TESTING, TaskStatus.FEEDBACK]])
     }
-
 
 @router.delete("/{task_id}/sprint", status_code=status.HTTP_200_OK)
 async def remove_task_from_sprint(
