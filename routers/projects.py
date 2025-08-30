@@ -160,7 +160,8 @@ async def add_user_to_project(
     # إنشاء العلاقة الجديدة
     new_association = UserProject(
         user_id=user_to_add.id,
-        project_id=project_id
+        project_id=project_id,
+        story_points=40  # القيمة الافتراضية
     )
 
     db.add(new_association)

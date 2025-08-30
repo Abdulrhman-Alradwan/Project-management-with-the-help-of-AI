@@ -13,6 +13,7 @@ from models import PriorityEnum, DependencyType, Project, User, Task, TaskStatus
 from routers.auth import get_current_user, check_project_permission
 from routers.sprints import check_dependency_status
 import json
+from sqlalchemy import func
 
 
 
@@ -184,29 +185,71 @@ def calculate_user_workload(db: Session, user_id: int, project_id: int):
     """
     حساب الـ Workload للمستخدم في المشروع بناءً على مجموع نقاط المهام المسندة إليه
     """
-    # حساب مجموع story points للمهام المسندة للمستخدم في المشروع
-    total_assigned_points = db.query(
-        db.func.coalesce(db.func.sum(Task.story_points), 0)
-    ).filter(
-        Task.worker_id == user_id,
-        Task.project_id == project_id,
-        Task.status.notin_([TaskStatus.COMPLETE, TaskStatus.NOT_AVAILABLE])
-    ).scalar()
-
-    # حساب الـ Workload كنسبة مئوية (نفترض أن السعة القصوى هي 40 نقطة = 100%)
-    workload_percentage = min(100, int((total_assigned_points / 40) * 100))
-
-    # تحديث الـ Workload في جدول UserProject
+    # جلب story_points للمستخدم من جدول UserProject
     user_project = db.query(UserProject).filter(
         UserProject.user_id == user_id,
         UserProject.project_id == project_id
     ).first()
 
+    if not user_project or user_project.story_points is None:
+        user_story_points = 40  # القيمة الافتراضية
+    else:
+        user_story_points = user_project.story_points
+
+    # حساب مجموع story points للمهام المسندة للمستخدم في المشروع
+    total_assigned_points = db.query(
+        func.coalesce(func.sum(Task.story_points), 0)
+    ).filter(
+        Task.worker_id == user_id,
+        Task.project_id == project_id,
+        Task.status.notin_([TaskStatus.COMPLETE])
+    ).scalar()
+
+    # حساب الـ Workload كنسبة مئوية
+    if user_story_points > 0:
+        workload_percentage = min(100, int((total_assigned_points / user_story_points) * 100))
+    else:
+        workload_percentage = 0
+
+    # تحديث الـ Workload في جدول UserProject
     if user_project:
         user_project.workload = workload_percentage
         db.commit()
 
     return workload_percentage
+
+
+
+def check_workload_percentage(db: Session, user_id: int, project_id: int, new_story_points: int) -> bool:
+    """
+    التحقق مما إذا كان عبء العمل سيتجاوز 100% بعد إضافة المهمة الجديدة
+    """
+    # جلب story_points للمستخدم من جدول UserProject
+    user_project = db.query(UserProject).filter(
+        UserProject.user_id == user_id,
+        UserProject.project_id == project_id
+    ).first()
+
+    if not user_project or user_project.story_points is None:
+        user_story_points = 40  # القيمة الافتراضية
+    else:
+        user_story_points = user_project.story_points
+
+    # حساب مجموع story points الحالي للمهام المسندة للمستخدم
+    current_total_points = db.query(
+        func.coalesce(func.sum(Task.story_points), 0)
+    ).filter(
+        Task.worker_id == user_id,
+        Task.project_id == project_id,
+        Task.status.notin_([TaskStatus.COMPLETE])
+    ).scalar()
+
+    # حساب النسبة المئوية الجديدة لعبء العمل
+    new_total_points = current_total_points + new_story_points
+    new_workload_percentage = (new_total_points / user_story_points) * 100
+
+    # التحقق من عدم تجاوز 100%
+    return new_workload_percentage <= 100
 
 
 
@@ -222,7 +265,7 @@ class CreateTaskRequest(BaseModel):
 
     @validator('deadline')
     def validate_deadline(cls, v):
-        if v and v <= datetime.now():
+        if v and v <= datetime.now(timezone.utc):
             raise ValueError('Deadline must be in the future')
         return v
 class UpdateTaskRequest(BaseModel):
@@ -251,6 +294,7 @@ class UpdateTaskDependencyRequest(BaseModel):
 class AssignTaskRequest(BaseModel):
     user_id: int = Field(gt=0, description="ID of the user to assign the task to")
 
+
 @router.post("/{project_id}", status_code=status.HTTP_201_CREATED)
 async def create_task(
         user: user_dependency,
@@ -273,26 +317,18 @@ async def create_task(
             detail='Only project owner or assigned managers can create tasks'
         )
 
-    # التحقق من وجود العامل وانه عضو في المشروع
+    # إذا كانت المهمة مسندة لمستخدم، التحقق من عبء العمل
     if task_request.worker_id:
-        worker = db.query(User).filter(User.id == task_request.worker_id).first()
-        if not worker:
-            raise HTTPException(status_code=404, detail='User not found')
+        # ... (التحقق من وجود المستخدم وعضويته في المشروع)
 
-        if worker.role != RoleEnum.User.value:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Worker must be of type User'
-            )
+        # حساب عبء العمل الحالي للمستخدم
+        current_workload = calculate_user_workload(db, task_request.worker_id, project_id)
 
-        is_member = db.query(UserProject).filter(
-            UserProject.user_id == task_request.worker_id,
-            UserProject.project_id == project_id
-        ).first()
-        if not is_member:
+        # التحقق من إمكانية إسناد المهمة دون تجاوز عبء العمل
+        if not check_workload_percentage(db, task_request.worker_id, project_id, task_request.story_points):
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Assigned worker is not a member of this project'
+                status_code=400,
+                detail=f'Cannot assign task. User workload would exceed 100% (current: {current_workload}%, task: {task_request.story_points} points)'
             )
 
     # التحقق من المهمة التابعة
@@ -306,29 +342,29 @@ async def create_task(
                 detail='Dependent task must be in the same project'
             )
 
-        # تحويل قائمة المهارات إلى سلسلة JSON للتخزين
-        required_skills_str = None
-        if task_request.required_skills:
-            required_skills_str = json.dumps(task_request.required_skills)
+    # تحويل قائمة المهارات إلى سلسلة JSON للتخزين
+    required_skills_str = None
+    if task_request.required_skills:
+        required_skills_str = json.dumps(task_request.required_skills)
 
-        # إنشاء المهمة مع الحقول الجديدة
-        task = Task(
-            name=task_request.name,
-            status=TaskStatus.NOT_AVAILABLE.value,
-            project_id=project_id,
-            worker_id=task_request.worker_id,
-            dependent_on=task_request.dependent_on,
-            dependency_type=task_request.dependency_type.value if task_request.dependency_type else None,
-            priority=task_request.priority.value.lower() if task_request.priority else PriorityEnum.MEDIUM.value.lower(),
-            create_date=datetime.now(timezone.utc),
-            required_skills=required_skills_str,
-            story_points=task_request.story_points if task_request.story_points else 1,
-            deadline=task_request.deadline
-        )
+    # إنشاء المهمة مع الحقول الجديدة (تم نقل هذا خارج كتلة if)
+    task = Task(
+        name=task_request.name,
+        status=TaskStatus.NOT_AVAILABLE.value,
+        project_id=project_id,
+        worker_id=task_request.worker_id,
+        dependent_on=task_request.dependent_on,
+        dependency_type=task_request.dependency_type.value if task_request.dependency_type else None,
+        priority=task_request.priority.value.lower() if task_request.priority else PriorityEnum.MEDIUM.value.lower(),
+        create_date=datetime.now(timezone.utc),
+        required_skills=required_skills_str,
+        story_points=task_request.story_points if task_request.story_points else 1,
+        deadline=task_request.deadline
+    )
 
-        db.add(task)
-        db.commit()
-        db.refresh(task)
+    db.add(task)
+    db.commit()
+    db.refresh(task)
 
     # إنشاء سجل المهمة
     task_info = TaskInfo(
@@ -339,6 +375,10 @@ async def create_task(
     db.add(task_info)
     db.commit()
 
+    # إعادة حساب عبء العمل إذا كانت المهمة مسندة لمستخدم
+    if task_request.worker_id:
+        new_workload = calculate_user_workload(db, task_request.worker_id, project_id)
+
     return {
         "message": "Task created successfully",
         "task_id": task.id,
@@ -346,7 +386,8 @@ async def create_task(
         "worker_id": task.worker_id,
         "priority": task.priority,
         "story_points": task.story_points,
-        "deadline": task.deadline
+        "deadline": task.deadline,
+        "workload_percentage": new_workload if task_request.worker_id else None
     }
 
 
@@ -598,6 +639,7 @@ async def mark_task_as_complete(
 
     # حفظ معرف العامل قبل تغيير الحالة (لإعادة حساب الـ Workload)
     worker_id = task.worker_id
+    project_id = task.project_id
 
     # تغيير حالة المهمة
     task.status = TaskStatus.COMPLETE
@@ -617,7 +659,7 @@ async def mark_task_as_complete(
 
     # إعادة حساب الـ Workload للعامل إذا كانت المهمة مسندة له
     if worker_id:
-        calculate_user_workload(db, worker_id, task.project_id)
+        calculate_user_workload(db, worker_id, project_id)
 
     return {
         "message": "Task marked as complete",
@@ -826,12 +868,13 @@ async def delete_task(
         "worker_id": worker_id
     }
 
+
 @router.put("/{task_id}/assign", status_code=status.HTTP_200_OK)
 async def assign_task_to_user(
-    user: user_dependency,
-    db: db_dependency,
-    assign_request: AssignTaskRequest,
-    task_id: int = Path(gt=0)
+        user: user_dependency,
+        db: db_dependency,
+        assign_request: AssignTaskRequest,
+        task_id: int = Path(gt=0)
 ):
     if user is None:
         raise HTTPException(status_code=401, detail='Authentication required')
@@ -880,22 +923,30 @@ async def assign_task_to_user(
             detail='Assigned user is not a member of this project'
         )
 
-    # حساب الـ Workload الحالي للمستخدم
+    # حساب عبء العمل الحالي للمستخدم
     current_workload = calculate_user_workload(db, assign_request.user_id, task.project_id)
 
-    # التحقق من أن إضافة المهمة لن تتجاوز الحد الأقصى للـ Workload (100%)
-    if current_workload + task.story_points > 100:
+    # التحقق من إمكانية إسناد المهمة دون تجاوز عبء العمل
+    if not check_workload_percentage(db, assign_request.user_id, task.project_id, task.story_points):
         raise HTTPException(
             status_code=400,
-            detail=f'Cannot assign task. User workload would exceed 100% (current: {current_workload}%, task: {task.story_points}%)'
+            detail=f'Cannot assign task. User workload would exceed 100% (current: {current_workload}%, task: {task.story_points} points)'
         )
+
+    # حفظ معرف المستخدم الحالي قبل التحديث (لإعادة حساب عبء العمل)
+    old_worker_id = task.worker_id
+    project_id = task.project_id
 
     # تحديث المهمة بإسنادها للمستخدم
     task.worker_id = assign_request.user_id
     db.commit()
 
-    # إعادة حساب الـ Workload بعد إسناد المهمة
-    new_workload = calculate_user_workload(db, assign_request.user_id, task.project_id)
+    # إعادة حساب عبء العمل للعامل الجديد والقديم (إذا كان هناك عامل قديم)
+    if assign_request.user_id:
+        calculate_user_workload(db, assign_request.user_id, project_id)
+
+    if old_worker_id:
+        calculate_user_workload(db, old_worker_id, project_id)
 
     return {
         "message": "Task assigned successfully",
@@ -903,9 +954,7 @@ async def assign_task_to_user(
         "assigned_to": {
             "user_id": assign_request.user_id,
             "username": assignee.username
-        },
-        "workload_before": current_workload,
-        "workload_after": new_workload
+        }
     }
 
 
@@ -982,6 +1031,7 @@ async def unassign_task(
 
     # حفظ معرف المستخدم المسند إليه المهمة قبل إلغاء الإسناد
     old_worker_id = task.worker_id
+    project_id = task.project_id
 
     # إلغاء إسناد المهمة
     task.worker_id = None
@@ -989,7 +1039,7 @@ async def unassign_task(
 
     # إذا كانت المهمة مسندة سابقاً لمستخدم، إعادة حساب الـ Workload
     if old_worker_id:
-        calculate_user_workload(db, old_worker_id, task.project_id)
+        calculate_user_workload(db, old_worker_id, project_id)
 
     return {
         "message": "Task unassigned successfully",
